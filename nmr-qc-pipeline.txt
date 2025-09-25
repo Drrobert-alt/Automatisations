@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+nmr_qc_run.py
+End-to-End 1D-NMR QC-Pipeline, kompatibel zu den in Rnmr1D-Makros genutzten Abschnitten:
+- airpls lo hi lambda
+- normalisation CSN + Ranges bis 'EOL'
+- zero + Ranges bis 'EOL'
+- clupa/align Fenster (intern per DTW/CC umgesetzt)
+- bucket unif ... + Ranges bis 'EOL'
+
+Ausgabe:
+ processed/
+   specMat.parquet
+   buckets.csv
+   samples.csv
+   infos.csv
+ qc/
+   overlay_after_alignment.png
+   pca_buckets.png
+ logs/
+   run.log
+   sessioninfo.txt
+
+Benötigte Pakete:
+  pip install nmrglue pybaselines numpy scipy pandas pyarrow matplotlib scikit-learn dtaidistance rich
+"""
+
+from __future__ import annotations
+import argparse
+import sys, os, json, time, textwrap, traceback, platform
+from pathlib import Path
+from typing import List, Tuple, Dict, Any
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # headless
+import matplotlib.pyplot as plt
+
+from rich.console import Console
+from rich.table import Table
+from rich.progress import track
+
+# Optional
+try:
+    import nmrglue as ng
+except Exception as e:
+    ng = None
+try:
+    from pybaselines.whittaker import airpls
+except Exception:
+    airpls = None
+try:
+    from dtaidistance import dtw
+except Exception:
+    dtw = None
+
+console = Console()
+
+# _______________________
+# Utility & Logging
+
+
+def now() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+def write_text(p: Path, s: str):
+    p.write_text(s, encoding="utf-8")
+
+def save_sessioninfo(log_dir: Path):
+    info = {
+        "timestamp": now(),
+        "python": sys.version,
+        "platform": platform.platform(),
+        "packages": {
+            "numpy": np.__version__,
+            "pandas": pd.__version__,
+            "matplotlib": matplotlib.__version__,
+            "nmrglue": getattr(ng, "__version__", "not-installed") if ng else "not-imported",
+        },
+    }
+    write_text(log_dir / "sessioninfo.txt", json.dumps(info, indent=2))
+
+# _______________________
+# Samples & Macrofile
+
+REQ_SAMPLE_COLS = ["Spectrum", "Samplecode", "EXPNO", "PROCNO", "Treatment"]
+
+def load_samples(samples_file: Path) -> pd.DataFrame:
+    df = pd.read_csv(samples_file, sep="\t", dtype=str)
+    missing = [c for c in REQ_SAMPLE_COLS if c not in df.columns]
+    if missing:
+        raise ValueError(f"Samples.txt fehlt Spalten: {missing}")
+    # Type
+    df = df[REQ_SAMPLE_COLS].copy()
+    df["EXPNO"] = df["EXPNO"].astype(int)
+    df["PROCNO"] = df["PROCNO"].astype(int)
+    # Duplikate?
+    if df["Samplecode"].duplicated().any():
+        dups = df[df["Samplecode"].duplicated(keep=False)]["Samplecode"].tolist()
+        raise ValueError(f"Duplizierte Samplecode-Einträge: {sorted(set(dups))}")
+    return df
+
+def read_macro(cmd_file: Path) -> List[str]:
+    lines = [ln.rstrip("\n") for ln in cmd_file.read_text(encoding="utf-8").splitlines()]
+    return [ln for ln in lines if ln.strip() != ""]
+
+# _______________________
+# Macro-Parser 
+
+
+class Macro:
+    def __init__(self):
+        self.baseline_ranges: List[Tuple[float,float,int]] = []
+        self.normalization_method: str|None = None
+        self.normalization_ranges: List[Tuple[float,float]] = []
+        self.zero_ranges: List[Tuple[float,float]] = []
+        self.align_windows: List[Tuple[float,float,str]] = []  # (lo,hi,method)
+        self.bucket_mode: str|None = None
+        self.bucket_resolution_ppm: float|None = None
+        self.bucket_regions: List[Tuple[float,float]] = []
+
+def parse_macro(lines: List[str]) -> Macro:
+    m = Macro()
+    i = 0
+    while i < len(lines):
+        tok = lines[i].strip()
+        if tok.lower().startswith("airpls"):
+            # e.g. "airpls 4.966 9.348 3"
+            _, lo, hi, lam = tok.split()
+            m.baseline_ranges.append((float(lo), float(hi), int(lam)))
+        elif tok.lower().startswith("normalisation"):
+            # "normalisation CSN" gefolgt von Ranges bis "EOL"
+            parts = tok.split()
+            m.normalization_method = parts[1].upper()
+            i += 1
+            while i < len(lines) and lines[i].strip().upper() != "EOL":
+                lo, hi = lines[i].split()
+                m.normalization_ranges.append((float(lo), float(hi)))
+                i += 1
+        elif tok.lower().startswith("zero"):
+            i += 1
+            while i < len(lines) and lines[i].strip().upper() != "EOL":
+                lo, hi = lines[i].split()
+                m.zero_ranges.append((float(lo), float(hi)))
+                i += 1
+        elif tok.lower().startswith("clupa") or tok.lower().startswith("align"):
+            parts = tok.split()
+            if parts[0].lower() == "align":
+                lo, hi = float(parts[1]), float(parts[2])
+                m.align_windows.append((lo, hi, "local_cc"))
+            else:
+                lo, hi = float(parts[3]), float(parts[4])
+                m.align_windows.append((lo, hi, "dtw"))
+        elif tok.lower().startswith("bucket"):
+            parts = tok.split()
+            m.bucket_mode = parts[1].lower()
+                res = float(parts[4])
+            except Exception:
+                res = next(float(x) for x in parts[2:] if x.replace('.', '', 1).isdigit())
+            m.bucket_resolution_ppm = res
+            i += 1
+            while i < len(lines) and lines[i].strip().upper() != "EOL":
+                lo, hi = lines[i].split()
+                m.bucket_regions.append((float(lo), float(hi)))
+                i += 1
+        i += 1
+    return m
+
+# _______________________
+# NMR: Laden, FFT, Infos
+
+def load_bruker_spectrum(bruker_dir: Path) -> Tuple[np.ndarray, np.ndarray, Dict[str,Any]]:
+    """
+    Erwartet einen einzelnen Bruker-Datensatz-Folder (enthält 'fid' & 'acqus' etc.).
+    Gibt (ppm, intensity, infos) zurück.
+    """
+    if ng is None:
+        raise RuntimeError("nmrglue ist nicht installiert.")
+    dic, data = ng.bruker.read(str(bruker_dir))
+
+    try:
+        sw_h = float(dic["acqus"]["SW_h"])
+        sf = float(dic["acqus"]["SFO1"])
+    except Exception:
+        sw_h, sf = 6000.0, 500.0
+    n = int(1<<int(np.ceil(np.log2(len(data)))))
+    fid = data.astype(np.complex128)
+    spectrum = np.fft.fftshift(np.fft.fft(fid, n=n))
+    freq = np.linspace(-sw_h/2, sw_h/2, n, endpoint=False)
+    ppm = freq / sf + float(dic["acqus"].get("O1", 0.0))/sf*0.0  
+    y = spectrum.real
+    infos = {
+        "SF": sf, "SWH": sw_h, "SI": n,
+        "PULSE": dic["acqus"].get("PULPROG", ""),
+        "NUC": dic["acqus"].get("NUC1", ""),
+        "SOLVENT": dic["acqus"].get("SOLVENT", "")
+    }
+    return ppm, y, infos
+
+# _______________________
+# Processing-Schritte
+
+def baseline_airpls(ppm: np.ndarray, y: np.ndarray, lo: float, hi: float, lam: int) -> None:
+    if airpls is None:
+        raise RuntimeError("pybaselines ist nicht installiert.")
+    mask = (ppm >= lo) & (ppm <= hi)
+    if not mask.any(): 
+        return
+    _, bl = airpls(y[mask], lam=lam)
+    y[mask] = y[mask] - bl
+
+def zero_ranges(ppm: np.ndarray, y: np.ndarray, ranges: List[Tuple[float,float]]) -> None:
+    for lo, hi in ranges:
+        mask = (ppm >= lo) & (ppm <= hi)
+        y[mask] = 0.0
+
+def csn_normalize(ppm: np.ndarray, y: np.ndarray, regions: List[Tuple[float,float]]) -> np.ndarray:
+    if not regions:
+        s = np.trapz(np.maximum(y, 0), ppm)
+    else:
+        s = 0.0
+        for lo, hi in regions:
+            m = (ppm >= lo) & (ppm <= hi)
+            if m.any():
+                s += np.trapz(np.maximum(y[m], 0), ppm[m])
+    if s == 0:
+        return y
+    return y / s
+
+def align_window_dtw(ref_y: np.ndarray, y: np.ndarray) -> np.ndarray:
+    if dtw is None:
+        return y
+    path = dtw.warping_path(ref_y, y)
+    idx = np.array([j for (i, j) in path])
+    xnew = np.interp(np.arange(len(ref_y)), np.arange(len(idx)), y[idx])
+    return xnew
+
+def align_by_windows(ppm: np.ndarray,
+                     ref: np.ndarray,
+                     y: np.ndarray,
+                     windows: List[Tuple[float,float,str]]) -> np.ndarray:
+    out = y.copy()
+    for lo, hi, method in windows:
+        m = (ppm >= lo) & (ppm <= hi)
+        if not m.any():
+            continue
+        if method == "dtw":
+            out[m] = align_window_dtw(ref[m], out[m])
+        else:
+            seg_ref, seg_y = ref[m], out[m]
+            corr = np.correlate(seg_y - seg_y.mean(), seg_ref - seg_ref.mean(), mode="full")
+            shift = corr.argmax() - (len(seg_y)-1)
+            out[m] = np.roll(seg_y, shift)
+    return out
+
+def bucket_uniform(ppm: np.ndarray,
+                   Y: np.ndarray,
+                   regions: List[Tuple[float,float]],
+                   res_ppm: float) -> Tuple[pd.DataFrame, np.ndarray]:
+    edges_list = []
+    for lo, hi in regions:
+        n_steps = int(np.floor((hi - lo) / res_ppm)) + 1
+        edges = np.linspace(lo, hi, n_steps+1)
+        edges_list.append(edges)
+    edges = np.unique(np.concatenate(edges_list))
+    idx = np.digitize(ppm, edges) - 1
+    B = []
+    for k in range(len(edges)-1):
+        mask = idx == k
+        if mask.any():
+            B.append(Y[:, mask].sum(axis=1))
+        else:
+            B.append(np.zeros(Y.shape[0]))
+    B = np.vstack(B).T 
+    cols = [f"{edges[i]:.3f}-{edges[i+1]:.3f}" for i in range(len(edges)-1)]
+    return pd.DataFrame(B, columns=cols), edges
+
+# _______________________
+# Pipeline
+
+def run_pipeline(rawdir: Path, samples: pd.DataFrame, macro: Macro,
+                 outdir: Path, ncpu: int = 2) -> Dict[str, Any]:
+    ensure_dir(outdir)
+    proc_dir = outdir / "processed"
+    qc_dir = outdir / "qc"
+    log_dir = outdir / "logs"
+    for d in (proc_dir, qc_dir, log_dir):
+        ensure_dir(d)
+    save_sessioninfo(log_dir)
+
+    # Spektren laden
+    ppm_list, y_list, infos_rows = [], [], []
+    for _, row in track(samples.iterrows(), total=len(samples), description="Lade Spektren"):
+        spath = rawdir / row["Spectrum"] / str(row["EXPNO"]) / str(row["PROCNO"])
+        if not spath.exists():
+            raise FileNotFoundError(f"Bruker-Pfad fehlt: {spath}")
+        ppm, y, info = load_bruker_spectrum(spath)
+        ppm_list.append(ppm)
+        y_list.append(y.astype(float))
+        info_row = {
+            "Spectrum": row["Spectrum"],
+            "Samplecode": row["Samplecode"],
+            "EXPNO": row["EXPNO"],
+            "PROCNO": row["PROCNO"],
+            **info
+        }
+        infos_rows.append(info_row)
+
+    base_ppm = ppm_list[0]
+    for i, p in enumerate(ppm_list[1:], start=1):
+        if len(p) != len(base_ppm) or not np.allclose(p, base_ppm, rtol=0, atol=1e-6):
+            raise ValueError(f"PPM-Achse inkonsistent zwischen Spektrum 0 und {i}.")
+    ppm = base_ppm.copy()
+    Y = np.vstack([y for y in y_list])  # n x m
+
+    for lo, hi, lam in macro.baseline_ranges:
+        for i in range(Y.shape[0]):
+            baseline_airpls(ppm, Y[i, :], lo, hi, lam)
+
+    # Zeroing
+    if macro.zero_ranges:
+        for i in range(Y.shape[0]):
+            zero_ranges(ppm, Y[i, :], macro.zero_ranges)
+
+    if (macro.normalization_method or "").upper() == "CSN":
+        for i in range(Y.shape[0]):
+            Y[i, :] = csn_normalize(ppm, Y[i, :], macro.normalization_ranges)
+
+    sums = Y.sum(axis=1)
+    ref_idx = int(np.argmax(sums))
+    ref = Y[ref_idx, :].copy()
+    for i in range(Y.shape[0]):
+        if i == ref_idx: 
+            continue
+        Y[i, :] = align_by_windows(ppm, ref, Y[i, :], macro.align_windows)
+
+    plt.figure(figsize=(9, 4))
+    for i in range(Y.shape[0]):
+        plt.plot(ppm, Y[i, :], linewidth=0.6, alpha=0.7)
+    plt.gca().invert_xaxis()
+    plt.xlabel("ppm"); plt.ylabel("a.u."); plt.title("Overlay after alignment")
+    plt.tight_layout()
+    plt.savefig(qc_dir / "overlay_after_alignment.png", dpi=200)
+    plt.close()
+
+    if (macro.bucket_mode or "") == "unif" and macro.bucket_regions and macro.bucket_resolution_ppm:
+        buckets_df, edges = bucket_uniform(ppm, Y, macro.bucket_regions, macro.bucket_resolution_ppm)
+    else:
+        buckets_df, edges = pd.DataFrame(), np.array([])
+
+    if not buckets_df.empty:
+        try:
+            from sklearn.decomposition import PCA
+            X = (buckets_df - buckets_df.mean()) / (buckets_df.std(ddof=0) + 1e-12)
+            pca = PCA(n_components=2, random_state=0).fit(X)
+            T = pca.transform(X)
+            plt.figure(figsize=(5, 4))
+            treatments = samples["Treatment"].astype(str).tolist()
+            for tr in sorted(set(treatments)):
+                idx = [i for i, t in enumerate(treatments) if t == tr]
+                plt.scatter(T[idx, 0], T[idx, 1], label=tr, s=35)
+            plt.xlabel("PC1"); plt.ylabel("PC2"); plt.legend()
+            plt.title("PCA of buckets")
+            plt.tight_layout()
+            plt.savefig(qc_dir / "pca_buckets.png", dpi=200)
+            plt.close()
+        except Exception as e:
+            write_text(log_dir / "pca_error.txt", f"{now()} PCA error:\n{traceback.format_exc()}")
+
+    samples.to_csv(proc_dir / "samples.csv", index=False)
+    pd.DataFrame(infos_rows).to_csv(proc_dir / "infos.csv", index=False)
+
+    spec_df = pd.DataFrame(Y, index=samples["Samplecode"])
+    spec_df.to_parquet(proc_dir / "specMat.parquet")
+
+    if not buckets_df.empty:
+        buckets_df.insert(0, "Samplecode", samples["Samplecode"].values)
+        buckets_df.to_csv(proc_dir / "buckets.csv", index=False)
+
+    meta = {
+        "n_spectra": int(Y.shape[0]),
+        "n_points": int(Y.shape[1]),
+        "ref_index": ref_idx,
+        "bucket_bins": int(buckets_df.shape[1]-1) if not buckets_df.empty else 0,
+        "ppm_min": float(ppm.min()),
+        "ppm_max": float(ppm.max()),
+        "macro": {
+            "baseline": macro.baseline_ranges,
+            "normalization": macro.normalization_method,
+            "normalization_ranges": macro.normalization_ranges,
+            "zero_ranges": macro.zero_ranges,
+            "align_windows": macro.align_windows,
+            "bucket_mode": macro.bucket_mode,
+            "bucket_resolution_ppm": macro.bucket_resolution_ppm,
+            "bucket_regions": macro.bucket_regions,
+        }
+    }
+    write_text(proc_dir / "meta.json", json.dumps(meta, indent=2))
+
+    return {
+        "ppm": ppm,
+        "Y": Y,
+        "buckets": buckets_df,
+        "infos": pd.DataFrame(infos_rows),
+        "samples": samples,
+        "ref_index": ref_idx,
+        "outdir": outdir
+    }
+
+# _______________________
+# CLI
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="NMR QC Pipeline (Python3) – kompatibel mit Rnmr1D-Makroabschnitten."
+    )
+    ap.add_argument("--rawdir", required=True, type=Path, help="Root der Bruker-Rohdaten (enthält Unterordner je Spectrum/EXPNO/PROCNO).")
+    ap.add_argument("--samples", required=True, type=Path, help="Samples.txt (Tab-separiert) mit Spalten: Spectrum, Samplecode, EXPNO, PROCNO, Treatment.")
+    ap.add_argument("--macro", required=True, type=Path, help="Makrodatei wie im R-Beispiel (airpls/normalisation/zero/clupa/align/bucket).")
+    ap.add_argument("--outdir", required=True, type=Path, help="Zielordner, in den processed/, qc/, logs/ geschrieben werden.")
+    ap.add_argument("--ncpu", type=int, default=2, help="Anzahl Kerne (derzeit nur begrenzt genutzt).")
+    args = ap.parse_args()
+
+    if not args.rawdir.exists():
+        console.print(f"[red]RAWDIR nicht gefunden:[/red] {args.rawdir}"); sys.exit(2)
+    if not args.samples.exists():
+        console.print(f"[red]Samples.txt nicht gefunden:[/red] {args.samples}"); sys.exit(2)
+    if not args.macro.exists():
+        console.print(f"[red]Macrofile nicht gefunden:[/red] {args.macro}"); sys.exit(2)
+
+    ensure_dir(args.outdir)
+    log_dir = args.outdir / "logs"
+    ensure_dir(log_dir)
+    runlog = log_dir / "run.log"
+
+    try:
+        write_text(runlog, f"{now()} START\n")
+        df_samples = load_samples(args.samples)
+        lines = read_macro(args.macro)
+        macro = parse_macro(lines)
+
+        t = Table(title="Pipeline-Konfiguration")
+        t.add_column("Schritt"); t.add_column("Wert")
+        t.add_row("Baseline", str(macro.baseline_ranges))
+        t.add_row("Normalization", f"{macro.normalization_method} | {macro.normalization_ranges}")
+        t.add_row("Zeroing", str(macro.zero_ranges))
+        t.add_row("Alignment", str(macro.align_windows))
+        t.add_row("Bucketing", f"{macro.bucket_mode} @ {macro.bucket_resolution_ppm} ppm | {macro.bucket_regions}")
+        console.print(t)
+
+        res = run_pipeline(args.rawdir, df_samples, macro, args.outdir, ncpu=args.ncpu)
+        write_text(runlog, f"{now()} SUCCESS\n")
+        console.print(f"[green]Fertig.[/green] Ergebnisse in: {args.outdir.resolve()}")
+        console.print("Dateien:\n"
+                      f"  - processed/specMat.parquet\n"
+                      f"  - processed/buckets.csv\n"
+                      f"  - processed/samples.csv\n"
+                      f"  - processed/infos.csv\n"
+                      f"  - qc/overlay_after_alignment.png\n"
+                      f"  - qc/pca_buckets.png\n"
+                      f"  - logs/run.log, logs/sessioninfo.txt\n")
+    except Exception as e:
+        write_text(runlog, f"{now()} ERROR\n{traceback.format_exc()}\n")
+        console.print(f"[red]Fehler:[/red] {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
